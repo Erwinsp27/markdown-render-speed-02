@@ -438,6 +438,8 @@ P.url = function (src) {
 };
 P.inlineText = function (src) {
   const end = textRunEnd(src);
+  // A zero-length run means a trigger sits at position 0, so there is no
+  // plain text to emit here: let marked's own method decide the token.
   if (end === 0) return orig.inlineText.call(this, src);
   const raw = src.slice(0, end);
   const escaped = this.lexer.state.inRawBlock;

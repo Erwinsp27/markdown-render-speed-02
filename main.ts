@@ -24,12 +24,27 @@ function envDir(name: string, fallback: string): string {
 
 function loadCases(dir: string): BenchmarkCase[] {
   const raw = readFileSync(join(dir, 'cases.json'), 'utf8');
-  return JSON.parse(raw) as BenchmarkCase[];
+  const parsed: unknown = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error(`cases.json in ${dir} is not an array`);
+  }
+  for (const c of parsed) {
+    if (typeof c !== 'object' || c === null || typeof (c as BenchmarkCase).markdown !== 'string') {
+      throw new Error(`cases.json in ${dir} has a case without a string "markdown"`);
+    }
+  }
+  return parsed as BenchmarkCase[];
 }
 
 function renderAll(cases: BenchmarkCase[]): string[] {
   const out: string[] = [];
-  for (const { markdown } of cases) out.push(parse(markdown));
+  for (const c of cases) {
+    try {
+      out.push(parse(c.markdown));
+    } catch (err) {
+      throw new Error(`failed to render case ${c.id}: ${(err as Error).message}`);
+    }
+  }
   return out;
 }
 
