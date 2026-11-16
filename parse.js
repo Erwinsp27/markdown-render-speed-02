@@ -107,6 +107,207 @@ function skip3(src) {
   return i;
 }
 
+// ---------------------------------------------------------------------------
+// Second-level structural checks for block rules.
+//
+// The first-char dispatches below already skip a rule when its opening
+// character cannot start it. These helpers go one step further: they check
+// the characters the rule's regex needs *after* its opening character, so
+// a call that would fail the regex is skipped without running it. Each
+// helper is a *necessary* condition only — it answers false only when the
+// regex provably cannot match, and true whenever it might; a true answer
+// still calls marked's original method, so the output is unchanged by
+// construction. The proofs cite the exact regex from marked 18.1.3
+// (vendor/marked/marked.esm.js). By the time any tokenizer runs, the
+// lexer has replaced every \r\n and \r with \n, so only \n ends lines.
+// ---------------------------------------------------------------------------
+
+// list: marked's list rule is
+//   /^ {0,3}(?:[*+-]|\d{1,9}[.)])([ \t][^\n]*?)?(?:\n|$)/  (rules.block.list)
+// After the bullet, the optional group can only contribute a space or a
+// tab, and the rule must then end at a newline or at end of input — so the
+// character right after the bullet must be a space, a tab, a newline, or
+// the end of the string. A bullet followed by any other character (an
+// emphasis star, a hyphenated word, a year like 2024) cannot be a list
+// item. A numeric bullet is 1-9 digits followed by '.' or ')', then the
+// same terminator. listBulletEnd returns -1 when the rule cannot match.
+function termAfterBullet(src, i) {
+  const c = src.charCodeAt(i);
+  if (Number.isNaN(c) || c === 32 || c === 9 || c === 10) return i;
+  return -1;
+}
+
+function listBulletEnd(src, i) {
+  const c = src.charCodeAt(i);
+  if (c === 42 || c === 45 || c === 43) return termAfterBullet(src, i + 1);
+  if (c >= 48 && c <= 57) {
+    let j = i;
+    let n = 0;
+    while (j < src.length && src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) {
+      j++;
+      n++;
+    }
+    if (n > 9) return -1;
+    const d = src.charCodeAt(j);
+    if (d !== 46 && d !== 41) return -1;
+    return termAfterBullet(src, j + 1);
+  }
+  return -1;
+}
+
+// hr: marked's hr rule is
+//   /^ {0,3}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})(?:\n+|$)/
+// (rules.block.hr). A line can only be a thematic break when it holds
+// three or more of one marker (-, _ or *) with nothing but spaces or tabs
+// between them, and then ends. Scan the first line counting the marker:
+// fewer than three, or any other character before the line ends, means
+// the rule cannot match.
+function hrLine(src, i) {
+  const m = src.charCodeAt(i);
+  let n = 0;
+  let j = i;
+  while (j < src.length) {
+    const c = src.charCodeAt(j);
+    if (c === m) {
+      n++;
+      j++;
+    } else if (c === 32 || c === 9) {
+      j++;
+    } else {
+      break;
+    }
+  }
+  if (n < 3) return false;
+  const c = src.charCodeAt(j);
+  return Number.isNaN(c) || c === 10;
+}
+
+// fences: marked's fences rule is
+//   /^ {0,3}(`{3,}(?=[^`\n]*(?:\n|$))|~{3,})([^\n]*)(?:\n|$).../
+// (rules.block.fences). The opening fence is three or more backticks or
+// three or more tildes in a row; fewer than three of the same character
+// cannot open a fence. A further backtick on the line, or text after the
+// fence, only matters to the full regex — this check stays a necessary
+// condition and still calls the original method whenever three match.
+function fenceRun(src, i) {
+  const c = src.charCodeAt(i);
+  if (c !== 96 && c !== 126) return false;
+  return src.charCodeAt(i + 1) === c && src.charCodeAt(i + 2) === c;
+}
+
+// def: marked's def rule is
+//   /^ {0,3}\[(label)\]: *.../  (rules.block.def)
+// where the label is one or more of an escaped character, a character
+// other than '[', ']' or a backslash, or a newline that is not followed
+// by a blank line. So a definition can only start when the label is
+// closed by an unescaped ']' followed by ':' before the label runs out —
+// an unescaped '[' inside the label, or a blank line inside it, ends any
+// chance of a match. Scan the label and answer -1 when no closing can
+// still happen; otherwise return the index of the closing ']'.
+function defLabelEnd(src, i) {
+  if (src.charCodeAt(i) !== 91) return -1;
+  let j = i + 1;
+  while (j < src.length) {
+    const c = src.charCodeAt(j);
+    if (c === 92) {
+      j += 2;
+      continue;
+    }
+    if (c === 91) return -1;
+    if (c === 10) {
+      let k = j + 1;
+      while (src.charCodeAt(k) === 32 || src.charCodeAt(k) === 9) k++;
+      const n = src.charCodeAt(k);
+      if (n === 10 || Number.isNaN(n)) return -1;
+      j++;
+      continue;
+    }
+    if (c === 93) return src.charCodeAt(j + 1) === 58 ? j : -1;
+    j++;
+  }
+  return -1;
+}
+
+// lheading: marked's lheading rule is
+//   /^((?:.|\n(?!\s*?\n|bull |fences|blockquote|heading|hr|html|table))+?)
+//    \n {0,3}(=+|-+)[ \t]*(?:\n+|$)/
+// (rules.block.lheading, built from Oe). A setext heading can only match
+// when a line that is nothing but up to three spaces, a run of '=' or
+// '-', and trailing spaces or tabs — the underline — appears after the
+// first line and before the paragraph ends. The paragraph text cannot
+// cross a blank line (the lookahead blocks a newline followed by one), so
+// scan the lines until the first blank line: an underline found means the
+// rule might match, none found means it cannot. Lines that would start
+// another block rule are deliberately not treated as stops here —
+// stopping only at blank lines keeps this a necessary condition, and a
+// call the original method then settles.
+function isUnderlineLine(src, a, b) {
+  let i = a;
+  while (src.charCodeAt(i) === 32) i++;
+  if (i - a > 3) return false;
+  const c = src.charCodeAt(i);
+  if (c !== 61 && c !== 45) return false;
+  let k = i;
+  while (src.charCodeAt(k) === c) k++;
+  let t = k;
+  while (src.charCodeAt(t) === 32 || src.charCodeAt(t) === 9) t++;
+  return t >= b;
+}
+
+function isBlankLine(src, a, b) {
+  for (let q = a; q < b; q++) {
+    const c = src.charCodeAt(q);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+function setextUnderline(src) {
+  let line = 0;
+  let j = 0;
+  const n = src.length;
+  while (j <= n) {
+    let e = src.indexOf('\n', j);
+    if (e === -1) e = n;
+    if (line >= 1) {
+      if (isUnderlineLine(src, j, e)) return true;
+      if (isBlankLine(src, j, e)) return false;
+    }
+    if (e === n) return false;
+    j = e + 1;
+    line++;
+  }
+  return false;
+}
+
+// table: marked's table rule is
+//   /^ *([^\n ].*)\n {0,3}((?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?)(?:\n...|$)/
+// (rules.block.table, xe). The second line — the delimiter row — may only
+// hold '|', ':' and '-' with spaces or tabs around them, and it needs at
+// least one '-'; any other character on that line means the rule cannot
+// match. (Tabs are allowed by this check although the regex spells
+// spaces; that only ever calls the original method, never skips a table.)
+function tableDelimiter(src) {
+  let i = 0;
+  while (src.charCodeAt(i) === 32) i++;
+  if (Number.isNaN(src.charCodeAt(i)) || src.charCodeAt(i) === 10) return false;
+  const nl = src.indexOf('\n');
+  if (nl === -1) return false;
+  const nl2 = src.indexOf('\n', nl + 1);
+  const line2 = nl2 === -1 ? src.slice(nl + 1) : src.slice(nl + 1, nl2);
+  let dash = false;
+  for (let q = 0; q < line2.length; q++) {
+    const c = line2.charCodeAt(q);
+    if (c === 45) {
+      dash = true;
+      continue;
+    }
+    if (c === 124 || c === 58 || c === 32 || c === 9) continue;
+    return false;
+  }
+  return dash;
+}
+
 const P = Tokenizer.prototype;
 const orig = {};
 for (const name of [
@@ -132,8 +333,7 @@ P.code = function (src) {
   return undefined;
 };
 P.fences = function (src) {
-  const c = src.charCodeAt(skip3(src));
-  if (c !== 96 && c !== 126) return undefined;
+  if (!fenceRun(src, skip3(src))) return undefined;
   return orig.fences.call(this, src);
 };
 P.heading = function (src) {
@@ -141,8 +341,10 @@ P.heading = function (src) {
   return orig.heading.call(this, src);
 };
 P.hr = function (src) {
-  const c = src.charCodeAt(skip3(src));
+  const i = skip3(src);
+  const c = src.charCodeAt(i);
   if (c !== 45 && c !== 95 && c !== 42) return undefined;
+  if (!hrLine(src, i)) return undefined;
   return orig.hr.call(this, src);
 };
 P.blockquote = function (src) {
@@ -150,8 +352,7 @@ P.blockquote = function (src) {
   return orig.blockquote.call(this, src);
 };
 P.list = function (src) {
-  const c = src.charCodeAt(skip3(src));
-  if (c !== 42 && c !== 45 && c !== 43 && !(c >= 48 && c <= 57)) return undefined;
+  if (listBulletEnd(src, skip3(src)) === -1) return undefined;
   return orig.list.call(this, src);
 };
 P.html = function (src) {
@@ -159,20 +360,19 @@ P.html = function (src) {
   return orig.html.call(this, src);
 };
 P.def = function (src) {
-  if (src.charCodeAt(skip3(src)) !== 91) return undefined;
+  if (defLabelEnd(src, skip3(src)) === -1) return undefined;
   return orig.def.call(this, src);
 };
 P.table = function (src) {
-  let i = 0;
-  while (src.charCodeAt(i) === 32) i++;
-  const c = src.charCodeAt(i);
-  if (Number.isNaN(c) || c === 10) return undefined; // no header character
-  const nl = src.indexOf('\n');
-  if (nl === -1) return undefined;
-  const nl2 = src.indexOf('\n', nl + 1);
-  const line2 = nl2 === -1 ? src.slice(nl + 1) : src.slice(nl + 1, nl2);
-  if (line2.indexOf('-') === -1) return undefined; // delimiter row needs '-'
+  if (!tableDelimiter(src)) return undefined;
   return orig.table.call(this, src);
+};
+// lheading keeps marked's method, but only when a setext underline can
+// follow: its underline may sit several lines down, so setextUnderline
+// scans for it instead of looking at the first characters.
+P.lheading = function (src) {
+  if (!setextUnderline(src)) return undefined;
+  return orig.lheading.call(this, src);
 };
 P.paragraph = function (src) {
   if (src.charCodeAt(0) === 10) return undefined;
@@ -182,7 +382,6 @@ P.text = function (src) {
   if (src.charCodeAt(0) === 10) return undefined;
   return orig.text.call(this, src);
 };
-// lheading keeps marked's method: its underline may sit several lines down.
 
 // -- inline --
 P.escape = function (src) {
