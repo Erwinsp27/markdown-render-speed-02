@@ -1,101 +1,128 @@
-// swift-marked v3: marked 18.1.3 (vendored in vendor/marked/, MIT) with its
-// Tokenizer's hot methods patched in place. Each patch either proves from
-// the first characters that its rule cannot match (return undefined — the
-// rule's regex is anchored and needs those characters) or calls marked's
-// original method unchanged. Nothing about marked's tokenizing, parsing or
-// rendering is reimplemented, so the output is marked's output by
-// construction; the speed comes from skipping the dozen regex executions
-// the inline/block loops try at every position.
+// swift-marked v4: marked 18.1.3 (vendored under vendor/marked/, MIT) with the
+// Tokenizer's hot paths replaced by cheap pre-checks. Every replacement is a
+// *necessary* condition: it proves from the characters at hand that a rule's
+// own regular expression cannot match at this position, and only then skips
+// the rule. Whenever a rule might match, marked's original method runs
+// untouched, so the HTML is marked's HTML by construction; the gain is
+// purely the regex executions that never happen.
 //
-// The one method that does real work is inlineText: instead of running
-// marked's giant text regex over the whole remaining source, it first
-// scans for the next position where any inline rule could start (the
-// "trigger scan"), then builds the text token for just that run directly
-// (raw + numeric-reference decoding, exactly as marked's inlineText does).
-// The trigger set is a superset of every position where marked's text
-// token can end, so the tokens produced are the same ones marked
-// produces, only found with one cheap scan instead of a regex cascade.
+// The single exception is the inline text rule. It does real work: instead
+// of letting marked's large text pattern chew through the rest of the
+// source, it first finds the next spot where any other inline rule could
+// begin (one scan for "trigger" characters), then emits the plain-text
+// token for exactly that span — raw text plus numeric-reference decoding,
+// mirroring marked's own inlineText step by step. The trigger set covers
+// every place a text token may end, so the token stream is unchanged.
 
 import { Marked, Tokenizer } from './vendor/marked/marked.esm.js';
 
 // ---------------------------------------------------------------------------
-// Character classes (ASCII)
+// Tiny character helpers
 // ---------------------------------------------------------------------------
 
-const EMAIL_LOCAL = new Uint8Array(128);
+function isDigit(code) {
+  return code >= 48 && code <= 57;
+}
+
+function isAlpha(code) {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isAlphaNum(code) {
+  return isDigit(code) || isAlpha(code);
+}
+
+function isSpaceOrTab(code) {
+  return code === 32 || code === 9;
+}
+
+// Email local-part characters, from the RFC 5322 atom set marked relies on.
+// A 128-slot table keeps the "walk back over the local part" check O(1).
+const EMAIL_ATOM = new Uint8Array(128);
 for (const ch of "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&'*+/=?_`{|}~-") {
-  EMAIL_LOCAL[ch.charCodeAt(0)] = 1;
-}
-function isAlnum(c) {
-  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  EMAIL_ATOM[ch.charCodeAt(0)] = 1;
 }
 
 // ---------------------------------------------------------------------------
-// Inline text run scan
+// Where a plain-text run ends
 //
-// textRunEnd(src) returns the index where the plain-text run starting at 0
-// ends: the first position where marked's text token would stop, or
-// src.length. Stops are: a character that starts another inline rule
-// (\ < ! [ ` * ~ _), a scheme (http://, https://, ftp://), a www. with a
-// valid lookbehind (start, whitespace, *, _, ~, (), a mailto:/xmpp: preceded
-// by a non-alphanumeric (or at the start), the start of an email's local
-// part, and the first space of a "  \n" hard-break run.
+// plainRunEnd(src) answers: how far can a text token starting at index 0
+// run before marked would stop it? The stops are the openings of the other
+// inline rules (\ < ! [ ` * ~ _), a URL scheme (http://, https://,
+// ftp://), a "www." that a link could start from, "mailto:" / "xmpp:"
+// after a non-alphanumeric, the first character of an email address's
+// local part, and the first space of a double-space hard break ("  \n").
 // ---------------------------------------------------------------------------
 
-const TRIGGER_RE = /[\\<!\[`*~_]|(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.|mailto:|xmpp:|@| {2,}\n/g;
+const TRIGGER = /[\\<!\[`*~_]|(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.|mailto:|xmpp:|@| {2,}\n/g;
 
-function textRunEnd(src) {
-  TRIGGER_RE.lastIndex = 0;
-  let m;
-  while ((m = TRIGGER_RE.exec(src)) !== null) {
-    const i = m.index;
-    const tok = m[0];
-    const c0 = tok.charCodeAt(0);
-    if (c0 === 64) { // '@': walk back over the email local part
-      let s = i;
-      while (s > 0 && src.charCodeAt(s - 1) < 128 && EMAIL_LOCAL[src.charCodeAt(s - 1)]) s--;
-      if (s < i) return s;
-      continue; // lone '@', not an email start
+function plainRunEnd(src) {
+  TRIGGER.lastIndex = 0;
+  let hit;
+  while ((hit = TRIGGER.exec(src)) !== null) {
+    const at = hit.index;
+    const piece = hit[0];
+    const first = piece.charCodeAt(0);
+    if (first === 64) {
+      // '@' — maybe an email address starts here: step back over the
+      // local part and stop at its first character.
+      let start = at;
+      while (start > 0) {
+        const prev = src.charCodeAt(start - 1);
+        if (prev >= 128 || !EMAIL_ATOM[prev]) break;
+        start--;
+      }
+      if (start < at) return start;
+      continue; // a bare '@' is ordinary text
     }
-    if (tok.length === 1) return i; // \ < ! [ ` * ~ _
-    if (c0 === 32) return i; // "  \n": stop at the first space
-    if (tok === 'www.') {
-      if (i === 0) return i;
-      const p = src.charCodeAt(i - 1);
-      if (p === 32 || p === 9 || p === 10 || p === 13 || p === 42 || p === 95 || p === 126 || p === 40) return i;
-      continue; // www. without a valid lookbehind is plain text
+    if (piece.length === 1) return at; // \ < ! [ ` * ~ _
+    if (first === 32) return at; // "  \n" — stop at its first space
+    if (piece === 'www.') {
+      if (at === 0) return at;
+      const prev = src.charCodeAt(at - 1);
+      if (prev === 32 || prev === 9 || prev === 10 || prev === 13 || prev === 42 || prev === 95 || prev === 126 || prev === 40) return at;
+      continue; // "www." with no valid lookbehind is plain text
     }
-    if (tok === 'mailto:' || tok === 'xmpp:') {
-      if (i === 0) return i;
-      if (!isAlnum(src.charCodeAt(i - 1))) return i;
-      continue; // preceded by an alphanumeric: no autolink here
+    if (piece === 'mailto:' || piece === 'xmpp:') {
+      if (at === 0) return at;
+      if (!isAlphaNum(src.charCodeAt(at - 1))) return at;
+      continue; // an alphanumeric before the scheme means no autolink
     }
-    return i; // scheme:// — always a stop
+    return at; // a scheme:// always ends the run
   }
   return src.length;
 }
 
 // ---------------------------------------------------------------------------
-// Numeric character reference decoding, exactly as marked's helper does it
-// (helpers.ts decodeNumericCharacterReferences), using the rules' regexes.
+// Numeric character references, decoded exactly the way marked does
+// (helpers.ts decodeNumericCharacterReference): a bare '&' becomes
+// '&amp;', code points outside the valid range become U+FFFD, and 38
+// becomes '&amp;' again.
 // ---------------------------------------------------------------------------
 
-function decodeNumericRefs(text, other) {
+function decodeNumericEntities(text, other) {
   if (!other.numericCharacterReference.test(text)) return text;
-  return text.replace(other.numericCharacterReferenceOrAmpersand, (ref, dec, hex) => {
+  return text.replace(other.numericCharacterReferenceOrAmpersand, (whole, dec, hex) => {
     if (dec === undefined && hex === undefined) return '&amp;';
-    const code = dec === undefined ? Number.parseInt(hex, 16) : Number.parseInt(dec, 10);
-    if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '�';
-    return code === 38 ? '&amp;' : String.fromCodePoint(code);
+    const point = dec === undefined ? Number.parseInt(hex, 16) : Number.parseInt(dec, 10);
+    if (point === 0 || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) return '�';
+    return point === 38 ? '&amp;' : String.fromCodePoint(point);
   });
 }
 
 // ---------------------------------------------------------------------------
-// Block pre-checks. Each returns undefined when its rule cannot match,
-// otherwise it calls marked's original method.
+// Block-rule pre-checks
+//
+// By the time a tokenizer runs, the lexer has already folded every \r\n
+// and \r into \n, so a line always ends at \n here. Each helper below
+// answers a necessary condition for its rule's regex (marked 18.1.3,
+// vendor/marked/marked.esm.js): false means the regex cannot match and
+// the rule is skipped; true means the original method still runs, so the
+// output cannot drift.
 // ---------------------------------------------------------------------------
 
-function skip3(src) {
+// How far the up-to-three-space indent at a line start reaches.
+function leadingSpaces(src) {
   let i = 0;
   if (src.charCodeAt(0) === 32) {
     i = 1;
@@ -107,104 +134,77 @@ function skip3(src) {
   return i;
 }
 
-// ---------------------------------------------------------------------------
-// Second-level structural checks for block rules.
-//
-// The first-char dispatches below already skip a rule when its opening
-// character cannot start it. These helpers go one step further: they check
-// the characters the rule's regex needs *after* its opening character, so
-// a call that would fail the regex is skipped without running it. Each
-// helper is a *necessary* condition only — it answers false only when the
-// regex provably cannot match, and true whenever it might; a true answer
-// still calls marked's original method, so the output is unchanged by
-// construction. The proofs cite the exact regex from marked 18.1.3
-// (vendor/marked/marked.esm.js). By the time any tokenizer runs, the
-// lexer has replaced every \r\n and \r with \n, so only \n ends lines.
-// ---------------------------------------------------------------------------
-
-// list: marked's list rule is
-//   /^ {0,3}(?:[*+-]|\d{1,9}[.)])([ \t][^\n]*?)?(?:\n|$)/  (rules.block.list)
-// After the bullet, the optional group can only contribute a space or a
-// tab, and the rule must then end at a newline or at end of input — so the
-// character right after the bullet must be a space, a tab, a newline, or
-// the end of the string. A bullet followed by any other character (an
-// emphasis star, a hyphenated word, a year like 2024) cannot be a list
-// item. A numeric bullet is 1-9 digits followed by '.' or ')', then the
-// same terminator. listBulletEnd returns -1 when the rule cannot match.
-function termAfterBullet(src, i) {
+// list — marked's list regex needs the bullet followed by a space, a tab,
+// a newline, or the end of input (after the optional " " group the rule
+// must reach \n or $). A bullet glued to another character — an emphasis
+// star, a hyphenated word, a year like 2024 — can never be a list item.
+// Numeric bullets are 1–9 digits plus '.' or ')', then the same ending.
+// bulletEnd returns -1 when no list item can start at i.
+function afterBullet(src, i) {
   const c = src.charCodeAt(i);
   if (Number.isNaN(c) || c === 32 || c === 9 || c === 10) return i;
   return -1;
 }
 
-function listBulletEnd(src, i) {
+function bulletEnd(src, i) {
   const c = src.charCodeAt(i);
-  if (c === 42 || c === 45 || c === 43) return termAfterBullet(src, i + 1);
-  if (c >= 48 && c <= 57) {
+  if (c === 42 || c === 45 || c === 43) return afterBullet(src, i + 1);
+  if (isDigit(c)) {
     let j = i;
-    let n = 0;
-    while (j < src.length && src.charCodeAt(j) >= 48 && src.charCodeAt(j) <= 57) {
+    let digits = 0;
+    while (j < src.length && isDigit(src.charCodeAt(j))) {
       j++;
-      n++;
+      digits++;
     }
-    if (n > 9) return -1;
-    const d = src.charCodeAt(j);
-    if (d !== 46 && d !== 41) return -1;
-    return termAfterBullet(src, j + 1);
+    if (digits > 9) return -1;
+    const mark = src.charCodeAt(j);
+    if (mark !== 46 && mark !== 41) return -1;
+    return afterBullet(src, j + 1);
   }
   return -1;
 }
 
-// hr: marked's hr rule is
-//   /^ {0,3}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})(?:\n+|$)/
-// (rules.block.hr). A line can only be a thematic break when it holds
-// three or more of one marker (-, _ or *) with nothing but spaces or tabs
-// between them, and then ends. Scan the first line counting the marker:
-// fewer than three, or any other character before the line ends, means
-// the rule cannot match.
-function hrLine(src, i) {
-  const m = src.charCodeAt(i);
-  let n = 0;
+// hr — the rule needs three or more of one marker (-, _ or *) with only
+// spaces or tabs between them, then the line ends. Count the marker on
+// the first line; fewer than three, or any other character before the
+// line ends, rules the rule out.
+function hrLineOk(src, i) {
+  const marker = src.charCodeAt(i);
+  let seen = 0;
   let j = i;
   while (j < src.length) {
     const c = src.charCodeAt(j);
-    if (c === m) {
-      n++;
+    if (c === marker) {
+      seen++;
       j++;
-    } else if (c === 32 || c === 9) {
+    } else if (isSpaceOrTab(c)) {
       j++;
     } else {
       break;
     }
   }
-  if (n < 3) return false;
-  const c = src.charCodeAt(j);
-  return Number.isNaN(c) || c === 10;
+  if (seen < 3) return false;
+  const next = src.charCodeAt(j);
+  return Number.isNaN(next) || next === 10;
 }
 
-// fences: marked's fences rule is
-//   /^ {0,3}(`{3,}(?=[^`\n]*(?:\n|$))|~{3,})([^\n]*)(?:\n|$).../
-// (rules.block.fences). The opening fence is three or more backticks or
-// three or more tildes in a row; fewer than three of the same character
-// cannot open a fence. A further backtick on the line, or text after the
-// fence, only matters to the full regex — this check stays a necessary
-// condition and still calls the original method whenever three match.
-function fenceRun(src, i) {
+// fences — an opening fence is three or more backticks or tildes in a
+// row. Fewer than three of the same character cannot open one; anything
+// else on the line is the full regex's business, so this stays a
+// necessary condition only.
+function hasFence(src, i) {
   const c = src.charCodeAt(i);
   if (c !== 96 && c !== 126) return false;
   return src.charCodeAt(i + 1) === c && src.charCodeAt(i + 2) === c;
 }
 
-// def: marked's def rule is
-//   /^ {0,3}\[(label)\]: *.../  (rules.block.def)
-// where the label is one or more of an escaped character, a character
-// other than '[', ']' or a backslash, or a newline that is not followed
-// by a blank line. So a definition can only start when the label is
-// closed by an unescaped ']' followed by ':' before the label runs out —
-// an unescaped '[' inside the label, or a blank line inside it, ends any
-// chance of a match. Scan the label and answer -1 when no closing can
-// still happen; otherwise return the index of the closing ']'.
-function defLabelEnd(src, i) {
+// def — a link definition opens with "[label]:" where the label holds
+// escaped characters, characters other than '[', ']' and '\', or a
+// newline that is not followed by a blank line. An unescaped '[' inside
+// the label, or a blank line inside it, ends the label's chances; a ']'
+// only counts when ':' follows it. defClose returns the index of that
+// ']' or -1.
+function defClose(src, i) {
   if (src.charCodeAt(i) !== 91) return -1;
   let j = i + 1;
   while (j < src.length) {
@@ -216,9 +216,9 @@ function defLabelEnd(src, i) {
     if (c === 91) return -1;
     if (c === 10) {
       let k = j + 1;
-      while (src.charCodeAt(k) === 32 || src.charCodeAt(k) === 9) k++;
-      const n = src.charCodeAt(k);
-      if (n === 10 || Number.isNaN(n)) return -1;
+      while (isSpaceOrTab(src.charCodeAt(k))) k++;
+      const after = src.charCodeAt(k);
+      if (after === 10 || Number.isNaN(after)) return -1;
       j++;
       continue;
     }
@@ -228,190 +228,189 @@ function defLabelEnd(src, i) {
   return -1;
 }
 
-// lheading: marked's lheading rule is
-//   /^((?:.|\n(?!\s*?\n|bull |fences|blockquote|heading|hr|html|table))+?)
-//    \n {0,3}(=+|-+)[ \t]*(?:\n+|$)/
-// (rules.block.lheading, built from Oe). A setext heading can only match
-// when a line that is nothing but up to three spaces, a run of '=' or
-// '-', and trailing spaces or tabs — the underline — appears after the
-// first line and before the paragraph ends. The paragraph text cannot
-// cross a blank line (the lookahead blocks a newline followed by one), so
-// scan the lines until the first blank line: an underline found means the
-// rule might match, none found means it cannot. Lines that would start
-// another block rule are deliberately not treated as stops here —
-// stopping only at blank lines keeps this a necessary condition, and a
-// call the original method then settles.
-function isUnderlineLine(src, a, b) {
-  let i = a;
+// lheading — a setext heading needs an underline line (up to three
+// spaces, a run of '=' or '-', trailing spaces/tabs, nothing else) after
+// the first line and before the paragraph ends. Paragraph text cannot
+// cross a blank line, so scan lines until the first blank one: an
+// underline found means the rule might match; none found means it
+// cannot. Lines that would open other block rules are deliberately not
+// treated as stops — stopping only at blank lines keeps this a
+// necessary condition.
+function isSetextLine(src, from, to) {
+  let i = from;
   while (src.charCodeAt(i) === 32) i++;
-  if (i - a > 3) return false;
+  if (i - from > 3) return false;
   const c = src.charCodeAt(i);
   if (c !== 61 && c !== 45) return false;
   let k = i;
   while (src.charCodeAt(k) === c) k++;
   let t = k;
-  while (src.charCodeAt(t) === 32 || src.charCodeAt(t) === 9) t++;
-  return t >= b;
+  while (isSpaceOrTab(src.charCodeAt(t))) t++;
+  return t >= to;
 }
 
-function isBlankLine(src, a, b) {
-  for (let q = a; q < b; q++) {
-    const c = src.charCodeAt(q);
-    if (c !== 32 && c !== 9) return false;
+function isEmptyLine(src, from, to) {
+  for (let q = from; q < to; q++) {
+    if (!isSpaceOrTab(src.charCodeAt(q))) return false;
   }
   return true;
 }
 
-function setextUnderline(src) {
-  let line = 0;
+function hasSetextUnderline(src) {
+  let lineNo = 0;
   let j = 0;
   const n = src.length;
   while (j <= n) {
-    let e = src.indexOf('\n', j);
-    if (e === -1) e = n;
-    if (line >= 1) {
-      if (isUnderlineLine(src, j, e)) return true;
-      if (isBlankLine(src, j, e)) return false;
+    let end = src.indexOf('\n', j);
+    if (end === -1) end = n;
+    if (lineNo >= 1) {
+      if (isSetextLine(src, j, end)) return true;
+      if (isEmptyLine(src, j, end)) return false;
     }
-    if (e === n) return false;
-    j = e + 1;
-    line++;
+    if (end === n) return false;
+    j = end + 1;
+    lineNo++;
   }
   return false;
 }
 
-// table: marked's table rule is
-//   /^ *([^\n ].*)\n {0,3}((?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?)(?:\n...|$)/
-// (rules.block.table, xe). The second line — the delimiter row — may only
-// hold '|', ':' and '-' with spaces or tabs around them, and it needs at
-// least one '-'; any other character on that line means the rule cannot
-// match. (Tabs are allowed by this check although the regex spells
-// spaces; that only ever calls the original method, never skips a table.)
-function tableDelimiter(src) {
+// table — the second line (the delimiter row) may only hold '|', ':',
+// '-', spaces and tabs, and it needs at least one '-'. Any other
+// character on that line rules the rule out. (Tabs are allowed here
+// although the regex spells spaces; that only ever calls the original
+// method, never skips a real table.)
+function hasTableDelimiter(src) {
   let i = 0;
   while (src.charCodeAt(i) === 32) i++;
-  if (Number.isNaN(src.charCodeAt(i)) || src.charCodeAt(i) === 10) return false;
+  const first = src.charCodeAt(i);
+  if (Number.isNaN(first) || first === 10) return false;
   const nl = src.indexOf('\n');
   if (nl === -1) return false;
   const nl2 = src.indexOf('\n', nl + 1);
-  const line2 = nl2 === -1 ? src.slice(nl + 1) : src.slice(nl + 1, nl2);
+  const row = nl2 === -1 ? src.slice(nl + 1) : src.slice(nl + 1, nl2);
   let dash = false;
-  for (let q = 0; q < line2.length; q++) {
-    const c = line2.charCodeAt(q);
+  for (let q = 0; q < row.length; q++) {
+    const c = row.charCodeAt(q);
     if (c === 45) {
       dash = true;
       continue;
     }
-    if (c === 124 || c === 58 || c === 32 || c === 9) continue;
+    if (c === 124 || c === 58 || isSpaceOrTab(c)) continue;
     return false;
   }
   return dash;
 }
 
-const P = Tokenizer.prototype;
-const orig = {};
+// ---------------------------------------------------------------------------
+// Patching the Tokenizer
+//
+// Keep marked's original methods, then replace each with a wrapper that
+// returns undefined as soon as the first character (plus the structural
+// checks above, where a rule needs more than its opening character)
+// proves the rule cannot match. The wrappers forward every argument, so
+// a rule that might match runs exactly as marked wrote it.
+// ---------------------------------------------------------------------------
+
+const Proto = Tokenizer.prototype;
+const original = {};
 for (const name of [
   'space', 'code', 'fences', 'heading', 'hr', 'blockquote', 'list', 'html',
   'def', 'table', 'lheading', 'paragraph', 'text',
   'escape', 'tag', 'link', 'reflink', 'emStrong', 'codespan', 'br', 'del',
   'autolink', 'url', 'inlineText',
-]) orig[name] = P[name];
+]) original[name] = Proto[name];
 
-// -- block --
-P.space = function (src) {
+// -- block rules --
+Proto.space = function (src) {
   const c = src.charCodeAt(0);
   if (c !== 32 && c !== 9 && c !== 10) return undefined;
-  return orig.space.call(this, src);
+  return original.space.call(this, src);
 };
-P.code = function (src) {
+Proto.code = function (src) {
   const c0 = src.charCodeAt(0);
-  if (c0 === 9) return orig.code.call(this, src);
+  if (c0 === 9) return original.code.call(this, src);
   if (c0 !== 32) return undefined;
-  // needs 4 spaces, or a tab within the first 4 characters
-  if (src.charCodeAt(1) === 32 && src.charCodeAt(2) === 32 && src.charCodeAt(3) === 32) return orig.code.call(this, src);
-  if (src.charCodeAt(1) === 9 || src.charCodeAt(2) === 9 || src.charCodeAt(3) === 9) return orig.code.call(this, src);
+  if (src.charCodeAt(1) === 32 && src.charCodeAt(2) === 32 && src.charCodeAt(3) === 32) return original.code.call(this, src);
+  if (src.charCodeAt(1) === 9 || src.charCodeAt(2) === 9 || src.charCodeAt(3) === 9) return original.code.call(this, src);
   return undefined;
 };
-P.fences = function (src) {
-  if (!fenceRun(src, skip3(src))) return undefined;
-  return orig.fences.call(this, src);
+Proto.fences = function (src) {
+  if (!hasFence(src, leadingSpaces(src))) return undefined;
+  return original.fences.call(this, src);
 };
-P.heading = function (src) {
-  if (src.charCodeAt(skip3(src)) !== 35) return undefined;
-  return orig.heading.call(this, src);
+Proto.heading = function (src) {
+  if (src.charCodeAt(leadingSpaces(src)) !== 35) return undefined;
+  return original.heading.call(this, src);
 };
-P.hr = function (src) {
-  const i = skip3(src);
+Proto.hr = function (src) {
+  const i = leadingSpaces(src);
   const c = src.charCodeAt(i);
   if (c !== 45 && c !== 95 && c !== 42) return undefined;
-  if (!hrLine(src, i)) return undefined;
-  return orig.hr.call(this, src);
+  if (!hrLineOk(src, i)) return undefined;
+  return original.hr.call(this, src);
 };
-P.blockquote = function (src) {
-  if (src.charCodeAt(skip3(src)) !== 62) return undefined;
-  return orig.blockquote.call(this, src);
+Proto.blockquote = function (src) {
+  if (src.charCodeAt(leadingSpaces(src)) !== 62) return undefined;
+  return original.blockquote.call(this, src);
 };
-P.list = function (src) {
-  if (listBulletEnd(src, skip3(src)) === -1) return undefined;
-  return orig.list.call(this, src);
+Proto.list = function (src) {
+  if (bulletEnd(src, leadingSpaces(src)) === -1) return undefined;
+  return original.list.call(this, src);
 };
-P.html = function (src) {
-  if (src.charCodeAt(skip3(src)) !== 60) return undefined;
-  return orig.html.call(this, src);
+Proto.html = function (src) {
+  if (src.charCodeAt(leadingSpaces(src)) !== 60) return undefined;
+  return original.html.call(this, src);
 };
-P.def = function (src) {
-  if (defLabelEnd(src, skip3(src)) === -1) return undefined;
-  return orig.def.call(this, src);
+Proto.def = function (src) {
+  if (defClose(src, leadingSpaces(src)) === -1) return undefined;
+  return original.def.call(this, src);
 };
-P.table = function (src) {
-  if (!tableDelimiter(src)) return undefined;
-  return orig.table.call(this, src);
+Proto.table = function (src) {
+  if (!hasTableDelimiter(src)) return undefined;
+  return original.table.call(this, src);
 };
-// lheading keeps marked's method, but only when a setext underline can
-// follow: its underline may sit several lines down, so setextUnderline
-// scans for it instead of looking at the first characters.
-P.lheading = function (src) {
-  if (!setextUnderline(src)) return undefined;
-  return orig.lheading.call(this, src);
+Proto.lheading = function (src) {
+  if (!hasSetextUnderline(src)) return undefined;
+  return original.lheading.call(this, src);
 };
-P.paragraph = function (src) {
+Proto.paragraph = function (src) {
   if (src.charCodeAt(0) === 10) return undefined;
-  return orig.paragraph.call(this, src);
+  return original.paragraph.call(this, src);
 };
-P.text = function (src) {
+Proto.text = function (src) {
   if (src.charCodeAt(0) === 10) return undefined;
-  return orig.text.call(this, src);
+  return original.text.call(this, src);
 };
 
-// -- inline --
-P.escape = function (src) {
+// -- inline rules --
+Proto.escape = function (src) {
   if (src.charCodeAt(0) !== 92) return undefined;
-  return orig.escape.call(this, src);
+  return original.escape.call(this, src);
 };
-P.tag = function (src) {
+Proto.tag = function (src) {
   if (src.charCodeAt(0) !== 60) return undefined;
-  return orig.tag.call(this, src);
+  return original.tag.call(this, src);
 };
-P.link = function (src) {
+Proto.link = function (src) {
   const c = src.charCodeAt(0);
   if (c !== 91 && c !== 33) return undefined;
-  return orig.link.call(this, src);
+  return original.link.call(this, src);
 };
-P.reflink = function (src, links) {
+Proto.reflink = function (src, links) {
   const c = src.charCodeAt(0);
   if (c !== 91 && c !== 33) return undefined;
-  return orig.reflink.call(this, src, links);
+  return original.reflink.call(this, src, links);
 };
-P.emStrong = function (src, maskedSrc, prevChar) {
+Proto.emStrong = function (src, maskedSrc, prevChar) {
   const c = src.charCodeAt(0);
   if (c !== 42 && c !== 95) return undefined;
-  return orig.emStrong.call(this, src, maskedSrc, prevChar);
+  return original.emStrong.call(this, src, maskedSrc, prevChar);
 };
-P.codespan = function (src) {
+Proto.codespan = function (src) {
   if (src.charCodeAt(0) !== 96) return undefined;
-  return orig.codespan.call(this, src);
+  return original.codespan.call(this, src);
 };
-P.br = function (src) {
+Proto.br = function (src) {
   const c0 = src.charCodeAt(0);
   if (c0 === 32) {
     if (src.charCodeAt(1) !== 32) return undefined;
@@ -420,40 +419,41 @@ P.br = function (src) {
   } else {
     return undefined;
   }
-  return orig.br.call(this, src);
+  return original.br.call(this, src);
 };
-P.del = function (src, maskedSrc, prevChar) {
+Proto.del = function (src, maskedSrc, prevChar) {
   if (src.charCodeAt(0) !== 126) return undefined;
-  return orig.del.call(this, src, maskedSrc, prevChar);
+  return original.del.call(this, src, maskedSrc, prevChar);
 };
-P.autolink = function (src) {
+Proto.autolink = function (src) {
   if (src.charCodeAt(0) !== 60) return undefined;
-  return orig.autolink.call(this, src);
+  return original.autolink.call(this, src);
 };
-P.url = function (src) {
+Proto.url = function (src) {
   const c = src.charCodeAt(0);
-  // a url starts with a scheme letter, 'www.', or an email local char
-  if (!isAlnum(c) && c !== 46 && c !== 95 && c !== 43 && c !== 45) return undefined;
-  return orig.url.call(this, src);
+  // A URL here starts with a scheme letter, "www.", or an email's
+  // first character.
+  if (!isAlphaNum(c) && c !== 46 && c !== 95 && c !== 43 && c !== 45) return undefined;
+  return original.url.call(this, src);
 };
-P.inlineText = function (src) {
-  const end = textRunEnd(src);
+Proto.inlineText = function (src) {
+  const end = plainRunEnd(src);
   // A zero-length run means a trigger sits at position 0, so there is no
-  // plain text to emit here: let marked's own method decide the token.
-  if (end === 0) return orig.inlineText.call(this, src);
+  // plain text to emit: let marked's own method decide the token.
+  if (end === 0) return original.inlineText.call(this, src);
   const raw = src.slice(0, end);
-  const escaped = this.lexer.state.inRawBlock;
+  const inRaw = this.lexer.state.inRawBlock;
   return {
     type: 'text',
     raw,
-    text: escaped ? raw : decodeNumericRefs(raw, this.rules.other),
-    escaped,
+    text: inRaw ? raw : decodeNumericEntities(raw, this.rules.other),
+    escaped: inRaw,
   };
 };
 
-const instance = new Marked();
+const marked = new Marked();
 
 /** The HTML marked renders for `markdown`, with marked's defaults. */
 export function parse(markdown) {
-  return instance.parse(markdown);
+  return marked.parse(markdown);
 }
